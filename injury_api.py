@@ -15,6 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- LISTE DES JOUEURS ---
 @app.get("/api/players")
 def get_all_players():
     try:
@@ -27,60 +28,108 @@ def get_all_players():
     except:
         return [{"id": 0, "name": "Erreur liste", "team": "", "position": ""}]
 
-# --- NOUVELLE LOGIQUE DE SCRAPING PLUS PRÉCISE ---
+# --- FONCTIONS DE SCRAPING ---
+
 def scrape_espn(player_name):
+    """Scrape ESPN NBA Injuries"""
     try:
         url = "https://www.espn.com/nba/injuries"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=5)
         
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(response.content, 'lxml')
-        
-        # On cherche tous les liens car les noms des joueurs sont des liens dans le tableau
-        links = soup.find_all('a')
-        
-        for link in links:
-            if player_name.lower() in link.text.lower():
-                # Bingo, on a trouvé le joueur. On remonte à la ligne (tr) du tableau
-                row = link.find_parent('tr')
-                if row:
-                    cols = row.find_all('td')
-                    # Structure typique ESPN : Nom | Pos | Date | Statut | Commentaire
-                    # On récupère tout le texte pertinent
-                    if len(cols) >= 2:
-                        # On essaie de concaténer le statut et le commentaire
-                        # Le statut est souvent dans la colonne 4 (index 3) et commentaire en 5 (index 4)
-                        full_text = ""
-                        for col in cols[1:]: # On ignore la colonne nom
-                            text = col.text.strip()
-                            if text:
-                                full_text += text + " "
-                        
-                        return {
-                            "status": "Blessé",
-                            "update": full_text.strip(), # Ex: "Day-to-Day Out with ankle injury"
-                            "timestamp": time.strftime("%H:%M")
-                        }
-        
-        return None # Pas trouvé dans la page -> Sain
-            
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            # Recherche large dans les liens
+            for link in soup.find_all('a'):
+                if player_name.lower() in link.text.lower():
+                    row = link.find_parent('tr')
+                    if row:
+                        cols = row.find_all('td')
+                        if len(cols) >= 2:
+                            full_text = " ".join([c.text.strip() for c in cols[1:]])
+                            return {
+                                "status": "Listé (ESPN)",
+                                "update": full_text[:150] + "..." if len(full_text) > 150 else full_text,
+                                "timestamp": time.strftime("%H:%M")
+                            }
+        return None
     except Exception as e:
-        print(f"Erreur Scraping: {e}")
+        print(f"Erreur ESPN: {e}")
         return None
 
+def scrape_cbs(player_name):
+    """Scrape CBS Sports NBA Injuries"""
+    try:
+        url = "https://www.cbssports.com/nba/injuries/"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            # CBS utilise des liens dans des tables pour les joueurs
+            for link in soup.find_all('a'):
+                if player_name.lower() in link.text.lower():
+                    # Remonter au TR parent
+                    row = link.find_parent('tr')
+                    if row:
+                        cols = row.find_all('td')
+                        # Colonnes CBS: Player | Position | Updated | Injury | Status
+                        if len(cols) >= 5:
+                            injury = cols[3].text.strip()
+                            status = cols[4].text.strip()
+                            return {
+                                "status": status or "Blessé",
+                                "update": f"{injury} - {status}",
+                                "timestamp": time.strftime("%H:%M")
+                            }
+        return None
+    except Exception as e:
+        print(f"Erreur CBS: {e}")
+        return None
+
+def scrape_fantasylabs(player_name):
+    """Scrape FantasyLabs NBA News"""
+    try:
+        # On cherche dans les news récentes, c'est le plus fiable pour FantasyLabs
+        url = "https://www.fantasylabs.com/nba/news/"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            # FantasyLabs liste des items de news
+            news_items = soup.find_all('div', class_='news-item')
+            
+            for item in news_items:
+                player_link = item.find('div', class_='player-name')
+                if player_link and player_name.lower() in player_link.text.lower():
+                    news_body = item.find('div', class_='news-body')
+                    news_text = news_body.text.strip() if news_body else "Nouvelle info disponible"
+                    return {
+                        "status": "News",
+                        "update": news_text[:150] + "..." if len(news_text) > 150 else news_text,
+                        "timestamp": time.strftime("%H:%M")
+                    }
+        return None
+    except Exception as e:
+        print(f"Erreur FantasyLabs: {e}")
+        return None
+
+# --- ENDPOINT PRINCIPAL ---
 @app.get("/api/injury/{player_name}")
 def get_injury_status(player_name: str):
     clean_name = player_name.strip()
+    
+    # Lancement séquentiel (pourrait être parallélisé pour plus de vitesse)
     espn_data = scrape_espn(clean_name)
+    cbs_data = scrape_cbs(clean_name)
+    fl_data = scrape_fantasylabs(clean_name)
     
     return {
         "player": clean_name,
         "sources": {
             "espn": espn_data,
-            "cbs": None, 
-            "fantasyLabs": None
+            "cbs": cbs_data, 
+            "fantasyLabs": fl_data
         }
     }
