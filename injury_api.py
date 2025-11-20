@@ -65,20 +65,79 @@ def get_team_urls(team_abbr, team_city, team_name):
 
     # NBC Mappings (CORRIGÉ : Utilisation de /injuries comme demandé)
     slug_nbc = f"{team_city}-{team_name}".lower().replace(' ', '-')
-    nbc_url = f"https://www.nbcsports.com/nba/{slug_nbc}/injuries" # Changement ici: /injuries
+    nbc_url = f"https://www.nbcsports.com/nba/{slug_nbc}/injuries" 
 
     return espn_url, cbs_url, nbc_url
 
 # --- SCRAPERS ---
 
+def determine_status_from_text(text):
+    """Détermine le statut court à partir du texte brut de la ligne d'incidence."""
+    lower_txt = text.lower()
+    if "out" in lower_txt: return "Out"
+    if "doubtful" in lower_txt: return "Doubtful"
+    if "questionable" in lower_txt: return "Questionable"
+    if "day-to-day" in lower_txt: return "Day-to-Day"
+    if "probable" in lower_txt: return "Probable"
+    if "available" in lower_txt or "active" in lower_txt: return "Available"
+    return "Listé"
+
 def scrape_espn_team_page(player_name, url):
     """
-    Scrape la page d'incidence spécifique à l'équipe ESPN (URL par ex: .../_/name/atl).
+    Scrape la page d'incidence spécifique à l'équipe ESPN.
+    Nouvelle approche : Cibler la ligne complète et analyser le texte pour plus de robustesse.
     """
     try:
         if not url: return None
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(url, headers=headers, timeout=4)
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            
+            # Cherche tous les liens ou cellules qui contiennent le nom du joueur
+            player_elements = soup.find_all(lambda tag: tag.name in ['a', 'span', 'div', 'td'] and player_name.lower() in tag.text.lower())
+            
+            for element in player_elements:
+                # Cherche le conteneur parent le plus pertinent (TR pour une table, DIV pour un layout)
+                row_container = element.find_parent('tr') or element.find_parent('div', class_=re.compile('Injury|List|Row|Item', re.IGNORECASE))
+                
+                if row_container:
+                    full_text = row_container.get_text(" ", strip=True)
+                    
+                    if len(full_text) > 30 and player_name.lower() in full_text.lower():
+                        status_short = determine_status_from_text(full_text)
+                        
+                        # Extraire la mise à jour (l'info de blessure et statut)
+                        # On essaie de trouver les colonnes Status et Injury
+                        cols = row_container.find_all(['td', 'div'])
+                        update_parts = []
+                        for col in cols:
+                            text = col.get_text(" ", strip=True)
+                            if len(text) > 5 and text.lower() not in player_name.lower():
+                                update_parts.append(text)
+                        
+                        update_text = " ".join(update_parts) or full_text.replace(player_name, "").strip()
+                        
+                        return {
+                            "status": status_short,
+                            "update": update_text[:250].strip() + "...",
+                            "timestamp": time.strftime("%H:%M")
+                        }
+        return None
+    except Exception as e: 
+        print(f"Erreur scraping ESPN: {e}")
+        return None
+
+def scrape_cbs_team_page(player_name, url):
+    """
+    Scrape la page d'incidence spécifique à l'équipe CBS Sports.
+    Utilisation de l'approche robuste par texte pour garantir la détection du statut.
+    """
+    try:
+        if not url: return None
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
@@ -88,65 +147,37 @@ def scrape_espn_team_page(player_name, url):
                 if player_name.lower() in link.text.lower():
                     row = link.find_parent('tr')
                     if row:
-                        # Les colonnes de la page équipe ESPN sont généralement : Player, Injury, Status
-                        cols = row.find_all('td')
-                        if len(cols) >= 3:
-                            # 1: Injury, 2: Status
-                            update_text = cols[1].text.strip()
-                            status_text = cols[2].text.strip()
+                        full_text = row.get_text(" ", strip=True)
+                        if len(full_text) > 30:
+                            status_short = determine_status_from_text(full_text)
                             
-                            status_short = "Listé"
-                            if "out" in status_text.lower(): status_short = "Out"
-                            elif "day-to-day" in status_text.lower(): status_short = "Day-to-Day"
-                            elif "questionable" in status_text.lower(): status_short = "Questionable"
-                            elif "probable" in status_text.lower(): status_short = "Probable"
-                            
-                            return {
-                                "status": status_short,
-                                "update": update_text[:200],
-                                "timestamp": time.strftime("%H:%M")
-                            }
-        return None
-    except: return None
+                            # On récupère l'info de blessure (colonne 1) et statut (colonne 3) si possible
+                            cols = row.find_all('td')
+                            injury = cols[1].text.strip() if len(cols) > 1 else ""
+                            status_col = cols[3].text.strip() if len(cols) > 3 else ""
 
-def scrape_cbs_team_page(player_name, url):
-    """
-    Scrape la page d'incidence spécifique à l'équipe CBS Sports (URL par ex: .../atlanta-hawks/injuries/).
-    """
-    try:
-        if not url: return None
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(url, headers=headers, timeout=4)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'lxml')
-            # Cherche tous les liens qui contiennent le nom du joueur
-            for link in soup.find_all('a'):
-                if player_name.lower() in link.text.lower():
-                    row = link.find_parent('tr')
-                    if row:
-                        # Les colonnes de la page équipe CBS sont généralement : Player, Injury, Updated, Status
-                        cols = row.find_all('td')
-                        if len(cols) >= 4:
-                            injury = cols[1].text.strip() # Blessure
-                            status = cols[3].text.strip() # Statut
+                            update_text = f"{injury} - {status_col}"
+                            if not injury:
+                                update_text = full_text.replace(player_name, "").strip()
+                            
                             return {
-                                "status": status or "Blessé",
-                                "update": f"{injury} - {status}",
+                                "status": status_short or status_col or "Blessé",
+                                "update": update_text[:250].strip() + "...",
                                 "timestamp": time.strftime("%H:%M")
                             }
         return None
-    except: return None
+    except Exception as e:
+        print(f"Erreur scraping CBS: {e}")
+        return None
 
 def scrape_nbc_team_page(player_name, url):
     """
-    Stratégie pour NBC Sports / Rotoworld: 
-    Cibler la page injuries/ (URL par ex: .../pelicans/injuries) pour trouver l'information dans le tableau/liste.
+    Scrape la page /injuries de NBC Sports / Rotoworld.
+    Nouvelle approche : Cibler la ligne complète de la liste d'incidents et analyser le texte.
     """
     try:
         if not url: return None
         
-        # Headers pour ressembler à un vrai navigateur
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -157,48 +188,28 @@ def scrape_nbc_team_page(player_name, url):
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
             
-            # La page /injuries de NBC/Rotoworld est généralement une liste simple ou un tableau.
-            
-            # Recherche de tous les conteneurs de news/joueur
-            news_containers = soup.find_all(['div', 'article'], class_=re.compile(r'PlayerNews-item|StoryLink|article|row|col', re.IGNORECASE))
+            # Cherche les conteneurs de type ligne de tableau/liste qui contiennent le nom du joueur
+            player_rows = soup.find_all(lambda tag: tag.name in ['tr', 'div', 'li', 'article'] and player_name.lower() in tag.get_text().lower())
 
-            for container in news_containers:
-                # 1. Chercher un élément qui contient le nom du joueur
-                if player_name.lower() in container.get_text().lower():
+            for row in player_rows:
+                # Filtrer les conteneurs trop courts pour être une mise à jour d'incidence réelle
+                full_text = row.get_text(" ", strip=True)
+
+                if len(full_text) > 50 and player_name.lower() in full_text.lower():
                     
-                    # 2. Extraire le titre (s'il existe, pour la fraîcheur)
-                    title_element = container.find(['a', 'h3', 'h4'], class_=re.compile(r'title|headline', re.IGNORECASE))
-                    title_text = title_element.get_text(" ", strip=True) if title_element else ""
-
-                    # 3. Extraire le corps/la mise à jour
-                    body_element = container.find('p', class_=re.compile(r'content|body|description', re.IGNORECASE)) or container.find('p')
-                    body_text = body_element.get_text(" ", strip=True) if body_element else ""
+                    status_short = determine_status_from_text(full_text)
                     
-                    full_text = (title_text + " " + body_text).strip()
-
-                    # Vérification de sécurité : longueur minimale pour être une news pertinente
-                    if len(full_text) > 50 and player_name.lower() in full_text.lower():
-                        
-                        status_short = "News"
-                        lower_txt = full_text.lower()
-                        
-                        # Déterminer le statut à partir du corps de la news
-                        if "out" in lower_txt: status_short = "Out"
-                        elif "available" in lower_txt: status_short = "Available"
-                        elif "questionable" in lower_txt: status_short = "Questionable"
-                        elif "day-to-day" in lower_txt: status_short = "Day-to-Day"
-                        elif "probable" in lower_txt: status_short = "Probable"
-                        
-                        # C'est le premier conteneur trouvé (le plus récent)
-                        return {
-                            "status": status_short,
-                            "update": full_text[:300].strip() + "...",
-                            "timestamp": "Récent" 
-                        }
+                    # Le texte brut de la ligne est notre meilleure mise à jour
+                    update_text = full_text.replace(player_name, "").strip()
+                    
+                    return {
+                        "status": status_short,
+                        "update": update_text[:300].strip() + "...",
+                        "timestamp": "Liste Incidents" 
+                    }
                         
         return None
     except Exception as e:
-        # Afficher l'erreur dans la console pour le debug si besoin
         print(f"Erreur NBC Team (Injuries): {e}")
         return None
 
