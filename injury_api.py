@@ -126,8 +126,8 @@ def scrape_cbs(player_name):
 
 def scrape_nbc_team_page(player_name, url):
     """
-    Nouvelle stratégie ciblée : On va directement sur la page News de l'équipe.
-    On parcourt la liste de haut en bas (chronologique) et on s'arrête au premier match.
+    Stratégie ultra-ciblée : Va sur la page News de l'équipe.
+    Recherche la news la plus récente où le NOM DU JOUEUR est dans le TITRE.
     """
     try:
         if not url: return None
@@ -143,45 +143,66 @@ def scrape_nbc_team_page(player_name, url):
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
             
-            # NBC Sports Player News Structure
-            # Généralement des cartes ou des divs avec des classes comme "PlayerNews-item" ou simplement des blocs de texte.
-            # Pour être robuste, on cherche le texte du nom du joueur, puis on remonte au bloc parent.
+            # Cibler les conteneurs de news. Rotoworld/NBC utilise souvent la classe 'PlayerNews-item'
+            # Mais par sécurité, on cible une div générique et on vérifie son contenu.
             
-            # On cherche tous les éléments contenant le nom du joueur
-            # Important : on utilise une Regex pour trouver le nom exact
-            elements = soup.find_all(string=re.compile(re.escape(player_name), re.IGNORECASE))
+            # On cherche les titres de news (souvent des <h3> ou <h4>) qui contiennent le nom du joueur
+            # On cherche spécifiquement la balise <a> dans la structure principale de l'article (ex: un h4 ou un h3 dans une div)
             
-            for element in elements:
-                # On remonte aux parents pour trouver le conteneur de la news entière
-                # On cherche un parent type 'div' ou 'p' qui contient assez de texte
-                container = element.find_parent('div')
+            # Cibler les blocs d'articles complets pour garantir la bonne chronologie
+            # Rotoworld utilise des structures variées, on cible les liens qui ont l'air d'être des titres
+            
+            # Recherche de tous les liens qui pourraient être des titres de news
+            news_links = soup.find_all('a', href=True)
+            
+            for link in news_links:
+                title_text = link.get_text(" ", strip=True)
                 
-                if container:
-                    full_text = container.get_text(" ", strip=True)
+                # S'assurer que le nom du joueur est dans le titre de l'article
+                if player_name.lower() in title_text.lower():
+                    # Une fois le titre ciblé, on essaie de remonter au conteneur de la news pour extraire le corps.
+                    # Le corps est souvent dans une balise <p> juste après le titre.
                     
+                    # On cherche le parent commun qui englobe le titre et le corps de la news (souvent une div)
+                    news_container = link.find_parent('div', class_=re.compile(r'NewsItem|PlayerNews-item|rotoworld-news-story', re.IGNORECASE))
+                    
+                    # Si on ne trouve pas de conteneur structuré, on utilise le texte suivant le lien.
+                    if not news_container:
+                        # Fallback: chercher le premier paragraphe ou texte significatif après le lien
+                        container = link.find_next_sibling(['p', 'div'])
+                    else:
+                        # Chercher le corps de la news dans le conteneur structuré
+                        container = news_container.find('p', class_=re.compile(r'NewsItem-content|Body', re.IGNORECASE)) or news_container.find('p')
+
+                    if container:
+                        full_text = title_text + " " + container.get_text(" ", strip=True)
+                    else:
+                        full_text = title_text # Si on n'a que le titre
+
                     # Vérification de sécurité : longueur minimale pour être une news
                     if len(full_text) > 50:
                         
-                        # Nettoyage du texte
-                        # On évite de prendre les titres de colonnes ou menus
                         status_short = "News"
                         lower_txt = full_text.lower()
                         
+                        # Déterminer le statut à partir du corps de la news
                         if "out" in lower_txt and ("ruled" in lower_txt or "will not play" in lower_txt): status_short = "Out"
                         elif "available" in lower_txt: status_short = "Available"
                         elif "questionable" in lower_txt: status_short = "Questionable"
                         elif "day-to-day" in lower_txt: status_short = "Day-to-Day"
                         elif "probable" in lower_txt: status_short = "Probable"
                         
+                        # Puisque nous avons trouvé la première news de la liste (la plus récente ET pertinente)
                         return {
                             "status": status_short,
-                            "update": full_text[:300] + "...", # On coupe proprement
-                            "timestamp": "Récent" # Sur NBC, la date exacte est dure à parser génériquement
+                            "update": full_text[:300].strip() + "...",
+                            "timestamp": "Récent" 
                         }
                         
         return None
     except Exception as e:
-        print(f"Erreur NBC Team: {e}")
+        # Afficher l'erreur dans la console pour le debug si besoin
+        print(f"Erreur NBC Team (Scraper mis à jour): {e}")
         return None
 
 @app.get("/api/injury/{player_name}")
@@ -213,7 +234,7 @@ def get_injury_status(player_name: str):
     # 2. Scrape CBS (Global List)
     cbs_data = scrape_cbs(clean_name)
     
-    # 3. Scrape NBC (Page d'équipe Spécifique - Plus précis pour les news récentes)
+    # 3. Scrape NBC (Page d'équipe Spécifique - Ciblage sur le Titre de l'article)
     nbc_data = scrape_nbc_team_page(clean_name, player_info.get('nbc_link'))
     
     # Injection des liens
