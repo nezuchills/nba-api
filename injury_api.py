@@ -69,67 +69,82 @@ def determine_status_from_text(text):
     if "probable" in lower_txt: return "Probable"
     return "Listé"
 
-# --- SCRAPER NBC REVU POUR ROBUSTESSE MAXIMALE ---
+# --- SCRAPER NBC REVU (Approche Bottom-Up) ---
 
 def scrape_nbc_team_page(player_name, url):
     """
-    Scrape la page /injuries de NBC Sports en utilisant une recherche très large 
-    des conteneurs de news.
+    Scrape la page /injuries de NBC Sports.
+    Approche : Trouve le nom du joueur dans le HTML, puis remonte aux parents 
+    pour trouver le texte contextuel.
     """
     try:
         if not url: return None
-        # Simuler un navigateur classique
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
+        # Headers complets pour simuler un vrai utilisateur (Chrome sur Windows)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.google.com/'
+        }
+        
+        # Timeout un peu plus long pour laisser le temps au serveur de répondre
+        response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
             
-            # TENTATIVE AGRESSIVE: Rechercher tous les conteneurs d'articles ou de news potentiels
-            # On cible les balises structurelles courantes pour les items de liste de news
-            all_potential_items = soup.find_all(['li', 'div', 'article', 'a'], class_=re.compile(r'StoryLink|StoryItem|article|news|feed|content', re.IGNORECASE))
+            # 1. Recherche directe du nom du joueur dans tout le document
+            # On utilise une regex pour ignorer la casse
+            target_elements = soup.find_all(string=re.compile(re.escape(player_name), re.IGNORECASE))
             
-            # ITÉRATION et FILTRAGE
-            for container in all_potential_items:
-                full_text = container.get_text(" ", strip=True)
+            for element in target_elements:
+                # L'élément trouvé est juste une chaîne de texte. 
+                # On doit vérifier ses parents pour trouver le conteneur de l'info.
                 
-                # Le nom du joueur doit être présent et le texte doit être assez long 
-                # pour être une vraie news (filtrer les liens de navigation)
-                if player_name.lower() in full_text.lower() and len(full_text) > 70:
+                # On remonte jusqu'à 3 niveaux de parents pour trouver un bloc de texte substantiel
+                parent = element.parent
+                grandparent = parent.parent if parent else None
+                greatgrandparent = grandparent.parent if grandparent else None
+                
+                candidates = [parent, grandparent, greatgrandparent]
+                
+                for container in candidates:
+                    if not container: continue
                     
-                    # 1. Déterminer le statut
-                    status_short = determine_status_from_text(full_text)
+                    full_text = container.get_text(" ", strip=True)
                     
-                    # 2. Tenter de trouver la date (dans le conteneur ou ses enfants)
-                    date_element = container.find(['span', 'p', 'time'], class_=re.compile(r'date|timestamp|pubTime|time', re.IGNORECASE))
-                    date_text = date_element.get_text(" ", strip=True) if date_element else "Récent"
-                    
-                    # 3. Tenter d'isoler l'update (titre + corps)
-                    title_element = container.find(['h2', 'h3', 'a'], class_=re.compile(r'title|headline|link', re.IGNORECASE))
-                    body_element = container.find('p', class_=re.compile(r'content|body|description|summary', re.IGNORECASE))
-
-                    update_text = ""
-                    if title_element: update_text += title_element.get_text(" ", strip=True) + " "
-                    if body_element: update_text += body_element.get_text(" ", strip=True)
-
-                    # Si on n'a rien trouvé de structuré, utiliser le texte brut du conteneur
-                    if not update_text:
-                        # Remplacer le nom du joueur par un espace pour nettoyer l'update
-                        update_text = re.sub(r'\b' + re.escape(player_name) + r'\b', '', full_text, flags=re.IGNORECASE).strip()
-
-                    # Si le texte est toujours trop court, on peut considérer que ce n'est pas la bonne news
-                    if len(update_text) < 30: continue
-                    
-                    return {
-                        "status": status_short,
-                        "update": update_text[:300].strip() + "...",
-                        "timestamp": date_text
-                    }
+                    # Si le texte contient plus que juste le nom du joueur (c'est une phrase ou un paragraphe)
+                    # Et ce n'est pas juste un lien de menu (souvent court)
+                    if len(full_text) > len(player_name) + 20:
                         
+                        # Nettoyage : On ne veut pas capturer toute la page si on est remonté trop haut (ex: body)
+                        if len(full_text) > 800: continue 
+                        
+                        status_short = determine_status_from_text(full_text)
+                        
+                        # Extraction d'une date si possible (format NBC habituel : Day, Mon DD)
+                        date_match = re.search(r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \w+ \d+\b', full_text)
+                        date_text = date_match.group(0) if date_match else "Récent"
+                        
+                        # Nettoyage pour l'affichage
+                        # On essaie d'isoler la partie "News" si possible
+                        update_text = full_text
+                        
+                        # Si on trouve le motif "Player Name ... News Text", on essaie de couper
+                        split_name = re.split(re.escape(player_name), full_text, flags=re.IGNORECASE, maxsplit=1)
+                        if len(split_name) > 1:
+                            # On prend ce qui suit le nom
+                            update_text = player_name + split_name[1]
+                        
+                        return {
+                            "status": status_short,
+                            "update": update_text[:300].strip() + "...",
+                            "timestamp": date_text
+                        }
+
         return None
     except Exception as e:
-        # Afficher l'erreur pour le débogage si le scraping échoue complètement
-        print(f"Erreur scraping NBC (Version MAX ROBuste): {e}")
+        print(f"Erreur scraping NBC (Bottom-Up): {e}")
         return None
 
 @app.get("/api/injury/{player_name}")
