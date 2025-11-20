@@ -20,7 +20,6 @@ app.add_middleware(
 @app.get("/api/players")
 def get_all_players():
     try:
-        # On récupère la liste statique pour la recherche rapide
         active_players = players.get_active_players()
         formatted_list = [
             {"id": p['id'], "name": p['full_name']} 
@@ -34,7 +33,6 @@ def get_all_players():
 
 def calculate_age(birth_date_str):
     try:
-        # Format NBA API typique: "1984-12-30T00:00:00"
         birth_date = datetime.strptime(birth_date_str.split('T')[0], "%Y-%m-%d")
         today = datetime.today()
         return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
@@ -42,37 +40,33 @@ def calculate_age(birth_date_str):
         return "??"
 
 def get_team_urls(team_abbr, team_city, team_name):
-    """Génère les liens directs vers les pages blessures des équipes"""
-    if not team_abbr:
-        return None, None
+    if not team_abbr: return None, None, None
     
     abbr_lower = team_abbr.lower()
     
-    # Mapping ESPN (Certaines équipes ont des codes différents)
-    # ex: Utah -> utah (pas uta), New Orleans -> no, Phoenix -> phx
+    # ESPN
     espn_abbr = abbr_lower
     if abbr_lower == 'uta': espn_abbr = 'utah'
     if abbr_lower == 'nop': espn_abbr = 'no'
     if abbr_lower == 'gsw': espn_abbr = 'gs'
     if abbr_lower == 'sas': espn_abbr = 'sa'
     if abbr_lower == 'nyk': espn_abbr = 'ny'
-    
     espn_url = f"https://www.espn.com/nba/team/injuries/_/name/{espn_abbr}"
     
-    # Mapping CBS
-    # ex: https://www.cbssports.com/nba/teams/ATL/atlanta-hawks/injuries/
-    slug = f"{team_city}-{team_name}".lower().replace(' ', '-').replace('76ers', '76ers') # Phila case
+    # CBS
+    slug = f"{team_city}-{team_name}".lower().replace(' ', '-').replace('76ers', '76ers')
     cbs_url = f"https://www.cbssports.com/nba/teams/{team_abbr.upper()}/{slug}/injuries/"
-    
-    return espn_url, cbs_url
+
+    # NBC (Lien générique car pas de page équipe standardisée simple pour les news)
+    nbc_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
+
+    return espn_url, cbs_url, nbc_url
 
 # --- SCRAPING ---
 
 def scrape_espn(player_name, team_url):
     try:
-        # On utilise l'URL générique si l'URL d'équipe échoue ou n'est pas fournie
         target_url = "https://www.espn.com/nba/injuries"
-        
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(target_url, headers=headers, timeout=4)
         
@@ -85,23 +79,18 @@ def scrape_espn(player_name, team_url):
                         cols = row.find_all('td')
                         if len(cols) >= 2:
                             full_text = " ".join([c.text.strip() for c in cols[1:]])
-                            
                             status_short = "Listé"
                             lower_txt = full_text.lower()
                             if "out" in lower_txt: status_short = "Out"
                             elif "day" in lower_txt: status_short = "Day-to-Day"
                             elif "questionable" in lower_txt: status_short = "Questionable"
-                            elif "doubtful" in lower_txt: status_short = "Doubtful"
-                            elif "probable" in lower_txt: status_short = "Probable"
-                            
                             return {
                                 "status": status_short,
                                 "update": full_text[:200],
                                 "timestamp": time.strftime("%H:%M")
                             }
         return None
-    except:
-        return None
+    except: return None
 
 def scrape_cbs(player_name, team_url):
     try:
@@ -125,54 +114,70 @@ def scrape_cbs(player_name, team_url):
                                 "timestamp": time.strftime("%H:%M")
                             }
         return None
-    except:
-        return None
+    except: return None
+
+def scrape_nbc(player_name, team_url):
+    try:
+        # NBC Sports News Feed
+        target_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(target_url, headers=headers, timeout=4)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            # NBC est complexe à scraper car dynamique, on fait une recherche textuelle large
+            # On cherche les blocs de news qui contiennent le nom du joueur
+            # Note: Ceci trouve les news récentes dans le feed global.
+            # Si le joueur n'a pas eu de news récente, rien ne remontera.
+            
+            # Recherche simplifiée dans le texte brut pour la démo
+            if player_name.lower() in soup.text.lower():
+                 return {
+                    "status": "News NBC",
+                    "update": "Le joueur est mentionné dans le fil d'actualité NBC Sports récent.",
+                    "timestamp": time.strftime("%H:%M")
+                }
+    except: return None
+    return None
 
 @app.get("/api/injury/{player_name}")
 def get_injury_status(player_name: str):
     clean_name = player_name.strip()
     
-    # 1. Récupérer ID et Infos Joueur (Equipe, Age)
-    # Cela prend un peu de temps API mais permet d'avoir les liens corrects
-    player_info = {"team": "NBA", "age": "", "espn_link": "", "cbs_link": ""}
+    player_info = {"team": "NBA", "age": "", "espn_link": "", "cbs_link": "", "nbc_link": ""}
     
     try:
         found_players = players.find_players_by_full_name(clean_name)
         if found_players:
             pid = found_players[0]['id']
-            # Appel API NBA pour les détails
             info = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_data_frames()[0]
             if not info.empty:
                 row = info.iloc[0]
-                team_abbr = row['TEAM_ABBREVIATION']
-                team_city = row['TEAM_CITY']
-                team_name = row['TEAM_NAME']
-                
-                # Construction des liens
-                espn_url, cbs_url = get_team_urls(team_abbr, team_city, team_name)
+                espn_url, cbs_url, nbc_url = get_team_urls(row['TEAM_ABBREVIATION'], row['TEAM_CITY'], row['TEAM_NAME'])
                 
                 player_info = {
-                    "team": f"{team_city} {team_name}",
+                    "team": f"{row['TEAM_CITY']} {row['TEAM_NAME']}",
                     "age": f"{calculate_age(row['BIRTHDATE'])} ans",
                     "espn_link": espn_url,
-                    "cbs_link": cbs_url
+                    "cbs_link": cbs_url,
+                    "nbc_link": nbc_url
                 }
-    except Exception as e:
-        print(f"Erreur metadata: {e}")
+    except Exception as e: print(e)
 
-    # 2. Scraping
     espn_data = scrape_espn(clean_name, player_info['espn_link'])
     cbs_data = scrape_cbs(clean_name, player_info['cbs_link'])
+    nbc_data = scrape_nbc(clean_name, player_info['nbc_link'])
     
-    # On injecte les liens d'équipe dans les objets data pour le frontend
     if espn_data: espn_data['url'] = player_info['espn_link']
     if cbs_data: cbs_data['url'] = player_info['cbs_link']
+    if nbc_data: nbc_data['url'] = player_info['nbc_link']
     
     return {
         "player": clean_name,
         "meta": player_info,
         "sources": {
             "espn": espn_data,
-            "cbs": cbs_data
+            "cbs": cbs_data,
+            "nbc": nbc_data
         }
     }
