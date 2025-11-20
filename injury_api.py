@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 from bs4 import BeautifulSoup
 import time
-import json
 from datetime import datetime
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import commonplayerinfo
@@ -42,10 +41,9 @@ def calculate_age(birth_date_str):
 
 def get_team_urls(team_abbr, team_city, team_name):
     if not team_abbr: return None, None, None
-    
     abbr_lower = team_abbr.lower()
     
-    # ESPN
+    # ESPN mapping
     espn_abbr = abbr_lower
     if abbr_lower == 'uta': espn_abbr = 'utah'
     if abbr_lower == 'nop': espn_abbr = 'no'
@@ -54,11 +52,11 @@ def get_team_urls(team_abbr, team_city, team_name):
     if abbr_lower == 'nyk': espn_abbr = 'ny'
     espn_url = f"https://www.espn.com/nba/team/injuries/_/name/{espn_abbr}"
     
-    # CBS
+    # CBS mapping
     slug = f"{team_city}-{team_name}".lower().replace(' ', '-').replace('76ers', '76ers')
     cbs_url = f"https://www.cbssports.com/nba/teams/{team_abbr.upper()}/{slug}/injuries/"
 
-    # NBC (Lien générique pour redirection)
+    # NBC/FantasyNews Link
     nbc_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
 
     return espn_url, cbs_url, nbc_url
@@ -67,9 +65,9 @@ def get_team_urls(team_abbr, team_city, team_name):
 
 def scrape_espn(player_name, team_url):
     try:
-        target_url = "https://www.espn.com/nba/injuries"
+        # ESPN Direct
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(target_url, headers=headers, timeout=4)
+        response = requests.get("https://www.espn.com/nba/injuries", headers=headers, timeout=4)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
@@ -95,9 +93,9 @@ def scrape_espn(player_name, team_url):
 
 def scrape_cbs(player_name, team_url):
     try:
-        target_url = "https://www.cbssports.com/nba/injuries/"
+        # CBS Direct
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(target_url, headers=headers, timeout=4)
+        response = requests.get("https://www.cbssports.com/nba/injuries/", headers=headers, timeout=4)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
@@ -117,80 +115,98 @@ def scrape_cbs(player_name, team_url):
         return None
     except: return None
 
-def scrape_nbc_fallback(player_name):
-    """Fallback sur Rotowire (plus facile à scraper) si NBC échoue"""
+# --- CHAÎNE DE SCRAPING NEWS (NBC -> ROTOWIRE -> FANTASYPROS) ---
+
+def scrape_fantasypros(player_name):
+    """Fallback 2 : FantasyPros (Très robuste)"""
     try:
-        url = "https://www.rotowire.com/basketball/news.php"
+        url = "https://www.fantasypros.com/nba/player-news.php"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
-            # Rotowire a une structure propre: div.news-update contenant le nom
-            news_items = soup.find_all('div', class_='news-update')
-            for item in news_items:
-                # Chercher le nom du joueur
-                player_link = item.find('a', class_='news-update__player-link')
-                if player_link and player_name.lower() in player_link.text.lower():
-                    # Trouver le texte de la news
-                    news_text_div = item.find('div', class_='news-update__news')
-                    if news_text_div:
-                        full_text = news_text_div.text.strip()
+            # Cherche les liens avec le nom du joueur
+            for link in soup.find_all('a'):
+                if player_name.lower() in link.text.lower():
+                    # Remonter au conteneur de la news
+                    # Structure souvent: div.content ou div.player-news-item
+                    container = link.find_parent('div', class_='content') or link.find_parent('div', class_='player-news-item')
+                    if container:
+                        full_text = container.text.strip()
+                        # Nettoyage simple
+                        clean_text = " ".join(full_text.split())
                         
-                        status_short = "News"
-                        if "out" in full_text.lower(): status_short = "Out"
-                        elif "questionable" in full_text.lower(): status_short = "Questionable"
+                        status = "News"
+                        if "out" in clean_text.lower(): status = "Out"
+                        elif "questionable" in clean_text.lower(): status = "Questionable"
                         
                         return {
-                            "status": status_short,
-                            "update": full_text[:250] + "...",
+                            "status": status,
+                            "update": clean_text[:250] + "...",
                             "timestamp": time.strftime("%H:%M")
                         }
     except: return None
     return None
 
-def scrape_nbc(player_name, team_url):
-    """Tentative NBC principale + Fallback"""
+def scrape_rotowire(player_name):
+    """Fallback 1 : Rotowire"""
     try:
-        target_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-        response = requests.get(target_url, headers=headers, timeout=5)
-        
-        found_data = None
-        
+        url = "https://www.rotowire.com/basketball/news.php"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=4)
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
-            
-            # Recherche textuelle large (plus robuste que les classes CSS qui changent)
-            # On cherche le nom du joueur, et on regarde le texte autour
-            page_text = soup.get_text(" ||| ", strip=True) # Séparateur unique
-            
-            # On cherche l'index du nom
+            for item in soup.find_all('div', class_='news-update'):
+                player_link = item.find('a', class_='news-update__player-link')
+                if player_link and player_name.lower() in player_link.text.lower():
+                    news_div = item.find('div', class_='news-update__news')
+                    if news_div:
+                        return {
+                            "status": "News",
+                            "update": news_div.text.strip()[:250] + "...",
+                            "timestamp": time.strftime("%H:%M")
+                        }
+    except: return None
+    return None
+
+def scrape_nbc_chain(player_name):
+    """Tente NBC, puis Rotowire, puis FantasyPros"""
+    
+    # 1. Tentative NBC
+    try:
+        url = "https://www.nbcsports.com/fantasy/basketball/player-news"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        response = requests.get(url, headers=headers, timeout=4)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'lxml')
+            page_text = soup.get_text(" ||| ", strip=True)
             idx = page_text.lower().find(player_name.lower())
             if idx != -1:
-                # On extrait une fenêtre de texte autour
-                snippet = page_text[idx:idx+400]
-                # Nettoyage sommaire
-                snippet = snippet.replace("|||", " ").strip()
-                
-                found_data = {
+                snippet = page_text[idx:idx+400].replace("|||", " ").strip()
+                return {
                     "status": "News (NBC)",
                     "update": snippet[:200] + "...",
                     "timestamp": time.strftime("%H:%M")
                 }
+    except: pass
 
-        if found_data:
-            return found_data
-        else:
-            # Si NBC direct échoue, on tente le fallback
-            return scrape_nbc_fallback(player_name)
-            
-    except Exception as e: 
-        print(f"Erreur NBC: {e}")
-        return scrape_nbc_fallback(player_name)
+    # 2. Fallback Rotowire
+    rw_data = scrape_rotowire(player_name)
+    if rw_data: 
+        rw_data['update'] = "(Via Rotowire) " + rw_data['update']
+        return rw_data
+
+    # 3. Fallback FantasyPros (Souvent le plus fiable sur serveur)
+    fp_data = scrape_fantasypros(player_name)
+    if fp_data:
+        fp_data['update'] = "(Via FantasyPros) " + fp_data['update']
+        return fp_data
+
+    return None
 
 @app.get("/api/injury/{player_name}")
 def get_injury_status(player_name: str):
@@ -205,21 +221,24 @@ def get_injury_status(player_name: str):
             info = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_data_frames()[0]
             if not info.empty:
                 row = info.iloc[0]
-                espn_url, cbs_url, nbc_url = get_team_urls(row['TEAM_ABBREVIATION'], row['TEAM_CITY'], row['TEAM_NAME'])
-                
+                espn, cbs, nbc = get_team_urls(row['TEAM_ABBREVIATION'], row['TEAM_CITY'], row['TEAM_NAME'])
                 player_info = {
                     "team": f"{row['TEAM_CITY']} {row['TEAM_NAME']}",
                     "age": f"{calculate_age(row['BIRTHDATE'])} ans",
-                    "espn_link": espn_url,
-                    "cbs_link": cbs_url,
-                    "nbc_link": nbc_url
+                    "espn_link": espn,
+                    "cbs_link": cbs,
+                    "nbc_link": nbc
                 }
-    except Exception as e: print(e)
+    except: pass
 
+    # Lancement des robots
     espn_data = scrape_espn(clean_name, player_info['espn_link'])
     cbs_data = scrape_cbs(clean_name, player_info['cbs_link'])
-    nbc_data = scrape_nbc(clean_name, player_info['nbc_link'])
     
+    # Chaîne NBC / News
+    nbc_data = scrape_nbc_chain(clean_name)
+    
+    # Ajout des liens de redirection
     if espn_data: espn_data['url'] = player_info['espn_link']
     if cbs_data: cbs_data['url'] = player_info['cbs_link']
     if nbc_data: nbc_data['url'] = player_info['nbc_link']
