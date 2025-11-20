@@ -1,3 +1,5 @@
+# requirements.txt : fastapi, uvicorn, requests, beautifulsoup4, lxml, nba_api, pandas
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -59,20 +61,16 @@ def get_team_urls(team_abbr, team_city, team_name):
     slug_cbs = f"{team_city}-{team_name}".lower().replace(' ', '-').replace('76ers', '76ers')
     cbs_url = f"https://www.cbssports.com/nba/teams/{team_abbr.upper()}/{slug_cbs}/injuries/"
 
-    # NBC Mappings (Correction demandée)
-    # Format: https://www.nbcsports.com/nba/portland-trail-blazers
+    # NBC Mappings (CORRIGÉ : Ajout de /player-news)
+    # Format: https://www.nbcsports.com/nba/new-orleans-pelicans/player-news
     slug_nbc = f"{team_city}-{team_name}".lower().replace(' ', '-')
-    nbc_url = f"https://www.nbcsports.com/nba/{slug_nbc}"
+    nbc_url = f"https://www.nbcsports.com/nba/{slug_nbc}/player-news"
 
     return espn_url, cbs_url, nbc_url
 
 # --- SCRAPERS ---
 
 def scrape_espn(player_name):
-    """
-    RETOUR AUX SOURCES : On scrape uniquement la liste globale ESPN.
-    C'est la méthode la plus fiable.
-    """
     try:
         target_url = "https://www.espn.com/nba/injuries"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -87,15 +85,12 @@ def scrape_espn(player_name):
                         cols = row.find_all('td')
                         if len(cols) >= 2:
                             full_text = " ".join([c.text.strip() for c in cols[1:]])
-                            
                             status_short = "Listé"
                             lower_txt = full_text.lower()
                             if "out" in lower_txt: status_short = "Out"
                             elif "day-to-day" in lower_txt: status_short = "Day-to-Day"
                             elif "questionable" in lower_txt: status_short = "Questionable"
-                            elif "doubtful" in lower_txt: status_short = "Doubtful"
                             elif "probable" in lower_txt: status_short = "Probable"
-                            
                             clean_update = full_text.replace(player_name, "").strip()
                             return {
                                 "status": status_short,
@@ -129,49 +124,65 @@ def scrape_cbs(player_name):
         return None
     except: return None
 
-def scrape_fantasypros_player(player_name):
-    """Fallback robuste pour NBC/Rotoworld via FantasyPros"""
+def scrape_nbc_team_page(player_name, url):
+    """
+    Nouvelle stratégie ciblée : On va directement sur la page News de l'équipe.
+    On parcourt la liste de haut en bas (chronologique) et on s'arrête au premier match.
+    """
     try:
-        slug = player_name.lower().replace(" ", "-").replace(".", "").replace("'", "")
-        url = f"https://www.fantasypros.com/nba/players/{slug}.php"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        if not url: return None
+        
+        # Headers pour ressembler à un vrai navigateur
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        
         response = requests.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
-            # Recherche ciblée dans les blocs de news
-            news_items = soup.find_all('div', class_='content')
-            for item in news_items:
-                paragraphs = item.find_all('p')
-                for p in paragraphs:
-                    text = p.get_text().strip()
-                    # On vérifie que c'est bien une news (longueur) et concerne le joueur
-                    if len(text) > 30 and player_name.split()[1].lower() in text.lower():
+            
+            # NBC Sports Player News Structure
+            # Généralement des cartes ou des divs avec des classes comme "PlayerNews-item" ou simplement des blocs de texte.
+            # Pour être robuste, on cherche le texte du nom du joueur, puis on remonte au bloc parent.
+            
+            # On cherche tous les éléments contenant le nom du joueur
+            # Important : on utilise une Regex pour trouver le nom exact
+            elements = soup.find_all(string=re.compile(re.escape(player_name), re.IGNORECASE))
+            
+            for element in elements:
+                # On remonte aux parents pour trouver le conteneur de la news entière
+                # On cherche un parent type 'div' ou 'p' qui contient assez de texte
+                container = element.find_parent('div')
+                
+                if container:
+                    full_text = container.get_text(" ", strip=True)
+                    
+                    # Vérification de sécurité : longueur minimale pour être une news
+                    if len(full_text) > 50:
+                        
+                        # Nettoyage du texte
+                        # On évite de prendre les titres de colonnes ou menus
                         status_short = "News"
-                        lower_txt = text.lower()
-                        if "out" in lower_txt and "rule" in lower_txt: status_short = "Out"
+                        lower_txt = full_text.lower()
+                        
+                        if "out" in lower_txt and ("ruled" in lower_txt or "will not play" in lower_txt): status_short = "Out"
+                        elif "available" in lower_txt: status_short = "Available"
                         elif "questionable" in lower_txt: status_short = "Questionable"
                         elif "day-to-day" in lower_txt: status_short = "Day-to-Day"
-                        elif "available" in lower_txt: status_short = "Available"
+                        elif "probable" in lower_txt: status_short = "Probable"
                         
                         return {
                             "status": status_short,
-                            "update": text[:250] + "...",
-                            "timestamp": "Récent"
+                            "update": full_text[:300] + "...", # On coupe proprement
+                            "timestamp": "Récent" # Sur NBC, la date exacte est dure à parser génériquement
                         }
                         
-            # Fallback générique sur la page
-            snippet = soup.find(string=re.compile(r'(injury|ruled out|questionable|game-time)', re.IGNORECASE))
-            if snippet:
-                parent = snippet.find_parent('p') or snippet.find_parent('div')
-                if parent:
-                     return {
-                        "status": "News",
-                        "update": parent.get_text().strip()[:200] + "...",
-                        "timestamp": "Récent"
-                    }
-    except: return None
-    return None
+        return None
+    except Exception as e:
+        print(f"Erreur NBC Team: {e}")
+        return None
 
 @app.get("/api/injury/{player_name}")
 def get_injury_status(player_name: str):
@@ -196,13 +207,16 @@ def get_injury_status(player_name: str):
                 }
     except: pass
 
-    # Scraping : On ignore désormais les liens d'équipe pour le scraping pur
-    # On utilise les méthodes globales robustes
+    # 1. Scrape ESPN (Global List)
     espn_data = scrape_espn(clean_name)
-    cbs_data = scrape_cbs(clean_name)
-    nbc_data = scrape_fantasypros_player(clean_name) # Sert de proxy pour NBC
     
-    # Injection des liens pour le frontend (C'est là que votre lien NBC corrigé est utilisé)
+    # 2. Scrape CBS (Global List)
+    cbs_data = scrape_cbs(clean_name)
+    
+    # 3. Scrape NBC (Page d'équipe Spécifique - Plus précis pour les news récentes)
+    nbc_data = scrape_nbc_team_page(clean_name, player_info.get('nbc_link'))
+    
+    # Injection des liens
     if espn_data: espn_data['url'] = player_info['espn_link']
     if cbs_data: cbs_data['url'] = player_info['cbs_link']
     if nbc_data: nbc_data['url'] = player_info['nbc_link']
