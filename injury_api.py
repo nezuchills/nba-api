@@ -57,7 +57,7 @@ def get_team_urls(team_abbr, team_city, team_name):
     slug = f"{team_city}-{team_name}".lower().replace(' ', '-').replace('76ers', '76ers')
     cbs_url = f"https://www.cbssports.com/nba/teams/{team_abbr.upper()}/{slug}/injuries/"
 
-    # NBC (Lien générique car pas de page équipe standardisée simple pour les news)
+    # NBC (Lien générique pour la consultation, le scraping se fait sur le feed global)
     nbc_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
 
     return espn_url, cbs_url, nbc_url
@@ -120,24 +120,54 @@ def scrape_nbc(player_name, team_url):
     try:
         # NBC Sports News Feed
         target_url = "https://www.nbcsports.com/fantasy/basketball/player-news"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(target_url, headers=headers, timeout=4)
+        # Headers améliorés pour éviter le blocage bot (403)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        response = requests.get(target_url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'lxml')
-            # NBC est complexe à scraper car dynamique, on fait une recherche textuelle large
-            # On cherche les blocs de news qui contiennent le nom du joueur
-            # Note: Ceci trouve les news récentes dans le feed global.
-            # Si le joueur n'a pas eu de news récente, rien ne remontera.
             
-            # Recherche simplifiée dans le texte brut pour la démo
+            # NBC liste les joueurs souvent sous forme de lien <a> ou dans des <div> NewsItem
+            # On cherche un lien contenant le nom du joueur
+            links = soup.find_all('a')
+            for link in links:
+                if player_name.lower() in link.text.lower():
+                    # On a trouvé le nom. On cherche le conteneur parent pour avoir le texte
+                    # La structure typique est un conteneur qui englobe le nom et le texte de la news
+                    container = link.find_parent('div')
+                    if container:
+                        full_text = container.text.strip()
+                        
+                        # Nettoyage basique : on essaie de ne garder que la partie pertinente
+                        # Souvent NBC met : "Nom Joueur - Position - Team ... Texte News"
+                        # On prend les 250 premiers caractères
+                        
+                        status_short = "News"
+                        lower_txt = full_text.lower()
+                        if "out" in lower_txt: status_short = "Out"
+                        elif "questionable" in lower_txt: status_short = "Questionable"
+                        elif "day-to-day" in lower_txt: status_short = "Day-to-Day"
+                        
+                        return {
+                            "status": status_short,
+                            "update": full_text[:250].strip() + ("..." if len(full_text) > 250 else ""),
+                            "timestamp": time.strftime("%H:%M")
+                        }
+
+            # Fallback : Recherche brute si la structure HTML a changé
             if player_name.lower() in soup.text.lower():
                  return {
-                    "status": "News NBC",
-                    "update": "Le joueur est mentionné dans le fil d'actualité NBC Sports récent.",
+                    "status": "News Récente",
+                    "update": f"Dernières nouvelles disponibles sur le flux NBC pour {player_name}.",
                     "timestamp": time.strftime("%H:%M")
                 }
-    except: return None
+    except Exception as e: 
+        print(f"Erreur NBC: {e}")
+        return None
     return None
 
 @app.get("/api/injury/{player_name}")
@@ -164,6 +194,7 @@ def get_injury_status(player_name: str):
                 }
     except Exception as e: print(e)
 
+    # On lance les 3 scrapers
     espn_data = scrape_espn(clean_name, player_info['espn_link'])
     cbs_data = scrape_cbs(clean_name, player_info['cbs_link'])
     nbc_data = scrape_nbc(clean_name, player_info['nbc_link'])
